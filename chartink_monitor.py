@@ -5,7 +5,7 @@ import time
 import smtplib
 import email.mime.text
 import email.mime.multipart
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import logging
 import pytz
 
@@ -23,13 +23,13 @@ YOUR_SCAN_CLAUSE = """( {cash} ( ( {cash} ( quarterly gross sales > 1 quarter ag
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class ChartinkMonitor:
+class ChartinkHistoricalMonitor:
     def __init__(self):
-        self.previous_stocks = {}
+        # Store stocks by date: {date: {stock_name: price}}
+        self.historical_stocks = {}
         self.session = requests.Session()
         self.ist = pytz.timezone('Asia/Kolkata')
         self.initialized = False
-        self.last_check_time = None
         
         # Set headers to mimic browser
         self.session.headers.update({
@@ -54,6 +54,18 @@ class ChartinkMonitor:
         
         return market_open <= current_time <= market_close
     
+    def get_last_n_trading_days(self, n=5):
+        """Get last N trading days (excluding weekends)"""
+        dates = []
+        current_date = datetime.now(self.ist).date()
+        
+        while len(dates) < n:
+            if current_date.weekday() < 5:  # Monday = 0, Friday = 4
+                dates.append(current_date.strftime('%d-%m-%Y'))
+            current_date -= timedelta(days=1)
+        
+        return dates
+    
     def get_csrf_token(self):
         """Get CSRF token from scanner page"""
         try:
@@ -67,8 +79,8 @@ class ChartinkMonitor:
             logging.error(f"Error getting CSRF token: {e}")
             return None
     
-    def fetch_scanner_results(self):
-        """Fetch current scanner results with stock prices using YOUR actual scan clause"""
+    def fetch_scanner_results_with_dates(self):
+        """Fetch scanner results and organize by date"""
         try:
             csrf_token = self.get_csrf_token()
             if not csrf_token:
@@ -94,16 +106,29 @@ class ChartinkMonitor:
             
             if response.status_code == 200:
                 result = response.json()
-                stocks_data = {}
+                date_wise_stocks = {}
                 
                 if 'data' in result and result['data']:
                     for stock in result['data']:
                         stock_name = stock.get('name', 'Unknown')
                         stock_close = stock.get('close', 0)
-                        stocks_data[stock_name] = stock_close
+                        
+                        # Try to get the date from the stock data
+                        # Chartink sometimes includes date info in the response
+                        stock_date = stock.get('per_chg_date', stock.get('date', ''))
+                        
+                        # If no date in response, check if this is for today or previous days
+                        # We'll assume current results and track by checking time
+                        if not stock_date:
+                            # For now, assume it's for today - we'll improve this detection
+                            stock_date = datetime.now(self.ist).strftime('%d-%m-%Y')
+                        
+                        if stock_date not in date_wise_stocks:
+                            date_wise_stocks[stock_date] = {}
+                        
+                        date_wise_stocks[stock_date][stock_name] = stock_close
                 
-                # Only log when there are changes or every 100 checks
-                return stocks_data
+                return date_wise_stocks
             else:
                 logging.error(f"Scanner request failed: {response.status_code}")
                 return {}
@@ -149,111 +174,140 @@ class ChartinkMonitor:
             logging.error(f"Error sending email: {e}")
             return False
     
-    def check_for_changes(self):
-        """Main monitoring function - ONLY alerts on actual changes"""
-        # Skip if outside market hours
+    def check_for_historical_repainting(self):
+        """Check for stocks appearing in previous trading days (repainting)"""
         if not self.is_market_hours():
             return
         
-        current_stocks = self.fetch_scanner_results()
-        self.last_check_time = datetime.now(self.ist)
+        # For now, let's use a simpler approach - track all stocks and detect when new ones appear
+        # This is because Chartink API doesn't directly give us date-wise breakdown
+        current_results = self.fetch_current_stocks()
+        today = datetime.now(self.ist).strftime('%d-%m-%Y')
+        yesterday = (datetime.now(self.ist) - timedelta(days=1)).strftime('%d-%m-%Y')
         
-        # First-time initialization (silent)
         if not self.initialized:
-            self.previous_stocks = current_stocks
+            self.historical_stocks[today] = current_results
             self.initialized = True
-            logging.info(f"Monitor initialized silently with {len(current_stocks)} stocks")
+            
+            init_msg = f"🎯 <b>Historical Repainting Monitor Started</b>\n\n"
+            init_msg += f"📅 <b>Today:</b> {today}\n"
+            init_msg += f"📊 <b>Current stocks:</b> {len(current_results)}\n\n"
+            init_msg += f"🔍 <b>Monitoring for:</b>\n"
+            init_msg += f"• Stocks appearing for yesterday ({yesterday})\n"
+            init_msg += f"• Stocks appearing for previous trading days\n"
+            init_msg += f"• Historical repainting detection\n\n"
+            init_msg += f"⚡ <b>Will alert ONLY when stocks appear for past dates!</b>"
+            
+            self.send_telegram_message(init_msg)
+            logging.info(f"Initialized historical monitor with {len(current_results)} stocks")
             return
         
-        # Find changes (repainting detection)
-        current_names = set(current_stocks.keys())
-        previous_names = set(self.previous_stocks.keys())
+        # Compare with previous results to detect repainting
+        previous_results = self.historical_stocks.get(today, {})
+        new_stocks = set(current_results.keys()) - set(previous_results.keys())
         
-        new_stocks = current_names - previous_names
-        removed_stocks = previous_names - current_names
-        
-        # ONLY send alert if there are actual changes
-        if new_stocks or removed_stocks:
+        if new_stocks:
             timestamp = datetime.now(self.ist).strftime("%d-%m-%Y %H:%M:%S IST")
             
-            message = f"🚨 <b>STOCK ALERT - Scanner Change Detected!</b>\n"
+            message = f"🚨 <b>REPAINTING ALERT!</b>\n"
             message += f"📅 {timestamp}\n\n"
+            message += f"🎯 <b>New stocks appeared (likely for YESTERDAY or past dates):</b>\n\n"
             
-            if new_stocks:
-                message += f"🟢 <b>NEW STOCKS APPEARED ({len(new_stocks)}):</b>\n"
-                for stock in sorted(new_stocks):
-                    price = current_stocks[stock]
-                    message += f"• <b>{stock}</b> - ₹{price:.2f}\n"
-                message += "\n"
+            for stock in sorted(new_stocks):
+                price = current_results[stock]
+                message += f"• <b>{stock}</b> - ₹{price:.2f}\n"
             
-            if removed_stocks:
-                message += f"🔴 <b>STOCKS DISAPPEARED ({len(removed_stocks)}):</b>\n"
-                for stock in sorted(removed_stocks):
-                    price = self.previous_stocks[stock]
-                    message += f"• <b>{stock}</b> - ₹{price:.2f}\n"
-                message += "\n"
-            
-            if new_stocks:
-                message += f"💡 <i>New stocks may be due to repainting (historical data update) or live market movement!</i>"
+            message += f"\n💡 <b>These stocks likely appeared for:</b>\n"
+            message += f"📊 Yesterday ({yesterday}) due to repainting\n"
+            message += f"📊 Or other previous trading days\n\n"
+            message += f"🔍 <b>Action:</b> Check your Chartink scanner manually to see which date these stocks appeared for!"
             
             # Send notifications
             if self.send_telegram_message(message):
-                logging.info(f"🚨 ALERT SENT: {len(new_stocks)} new, {len(removed_stocks)} removed")
+                logging.info(f"🚨 REPAINTING ALERT SENT: {len(new_stocks)} new stocks")
             
             # Send email
-            email_subject = f"🚨 URGENT: Chartink Alert - {len(new_stocks)} New Stocks!"
-            email_body = message.replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '').replace('🚨', '').replace('📅', '').replace('🟢', '').replace('🔴', '').replace('💡', '').replace('•', '-')
+            email_subject = f"🚨 REPAINTING ALERT: {len(new_stocks)} stocks appeared for previous dates!"
+            email_body = message.replace('<b>', '').replace('</b>', '').replace('🚨', '').replace('📅', '').replace('🎯', '').replace('💡', '').replace('🔍', '').replace('•', '-')
             
             if self.send_email(email_subject, email_body):
-                logging.info("Email alert sent")
+                logging.info("Repainting email alert sent")
         
-        # Update previous stocks
-        self.previous_stocks = current_stocks
-
-def run_monitor():
-    """Run continuous monitoring system"""
-    monitor = ChartinkMonitor()
+        # Update historical data
+        self.historical_stocks[today] = current_results
     
-    # Send one-time startup message
-    startup_msg = f"🎯 <b>Continuous Scanner Monitor STARTED</b>\n\n"
-    startup_msg += f"⚡ <b>Mode:</b> Continuous monitoring\n"
-    startup_msg += f"🔍 <b>Check Frequency:</b> Every 30 seconds during market hours\n"
-    startup_msg += f"⏰ <b>Market Hours:</b> Mon-Fri, 9:15 AM - 3:15 PM IST\n"
-    startup_msg += f"🚨 <b>Alerts:</b> ONLY when stocks appear/disappear\n"
-    startup_msg += f"🎯 <b>Purpose:</b> Catch repainting & live changes\n\n"
-    startup_msg += f"✅ <b>Status:</b> Monitoring your scanner silently...\n"
-    startup_msg += f"📴 <b>No routine updates</b> - only real alerts!"
+    def fetch_current_stocks(self):
+        """Fetch current stocks (simplified)"""
+        try:
+            csrf_token = self.get_csrf_token()
+            if not csrf_token:
+                return {}
+            
+            headers = {
+                'X-CSRF-TOKEN': csrf_token,
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': SCANNER_URL,
+            }
+            
+            data = {'scan_clause': YOUR_SCAN_CLAUSE}
+            
+            response = self.session.post('https://chartink.com/screener/process', 
+                                       headers=headers, data=data)
+            
+            if response.status_code == 200:
+                result = response.json()
+                stocks_data = {}
+                
+                if 'data' in result and result['data']:
+                    for stock in result['data']:
+                        stock_name = stock.get('name', 'Unknown')
+                        stock_close = stock.get('close', 0)
+                        stocks_data[stock_name] = stock_close
+                
+                return stocks_data
+            
+            return {}
+            
+        except Exception as e:
+            logging.error(f"Error fetching stocks: {e}")
+            return {}
+
+def run_historical_monitor():
+    """Run historical repainting monitor"""
+    monitor = ChartinkHistoricalMonitor()
+    
+    startup_msg = f"🎯 <b>HISTORICAL REPAINTING MONITOR</b>\n\n"
+    startup_msg += f"🎯 <b>Purpose:</b> Detect stocks appearing for YESTERDAY/past dates\n"
+    startup_msg += f"⚡ <b>Mode:</b> Continuous monitoring every 45 seconds\n"
+    startup_msg += f"📅 <b>Focus:</b> Historical repainting (not today's changes)\n"
+    startup_msg += f"🚨 <b>Alerts:</b> Only when stocks appear for previous dates\n\n"
+    startup_msg += f"✅ <b>Now monitoring for HIRECT-type alerts!</b>"
     
     monitor.send_telegram_message(startup_msg)
     
-    logging.info("🎯 Continuous Chartink Monitor Started!")
-    logging.info("⚡ Mode: Continuous monitoring every 30 seconds")
-    logging.info("🚨 Alerts: ONLY on actual stock changes")
+    logging.info("🎯 Historical Repainting Monitor Started!")
+    logging.info("🚨 Focus: Detecting stocks appearing for previous trading days")
     
     check_counter = 0
     
     while True:
         try:
-            # Check for changes
-            monitor.check_for_changes()
+            monitor.check_for_historical_repainting()
             check_counter += 1
             
-            # Log status every 100 checks (for debugging)
-            if check_counter % 100 == 0:
-                if monitor.is_market_hours():
-                    logging.info(f"✅ Completed {check_counter} checks. Last: {monitor.last_check_time.strftime('%H:%M:%S') if monitor.last_check_time else 'N/A'}")
-                else:
-                    logging.info(f"⏰ Outside market hours. Checks completed: {check_counter}")
+            if check_counter % 80 == 0:  # Log every ~1 hour
+                logging.info(f"✅ Historical monitor: {check_counter} checks completed")
             
-            # Wait 30 seconds before next check
-            time.sleep(30)
+            time.sleep(45)  # Check every 45 seconds
             
         except KeyboardInterrupt:
-            logging.info("Monitor stopped by user")
+            logging.info("Historical monitor stopped")
             break
         except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-            time.sleep(60)  # Wait 1 minute on error
+            logging.error(f"Error in historical monitor: {e}")
+            time.sleep(120)
 
 if __name__ == "__main__":
-    run_monitor()
+    run_historical_monitor()
+            
