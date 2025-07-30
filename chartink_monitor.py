@@ -8,6 +8,11 @@ from datetime import datetime, timedelta
 import logging
 import pytz
 import json
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # Your Configuration
 TELEGRAM_TOKEN = "6686777921:AAE3o3dGRJOLHWAzf4TqNLiJ6RaGEczIl4E"
@@ -17,26 +22,88 @@ SENDER_EMAIL = "excelyourtrade@gmail.com"
 APP_PASSWORD = "bxph anbw sqbx vezk"
 SCANNER_URL = "https://chartink.com/screener/copy-2112-chartpulse-cp-swing-trade"
 
-# Your scan clause
-YOUR_SCAN_CLAUSE = """( {cash} ( ( {cash} ( quarterly gross sales > 1 quarter ago gross sales and quarterly foreign institutional investors percentage > 1 quarter ago foreign institutional investors percentage and net profit[yearly] > 0 and weekly cci( 34 ) > 100 and weekly high > 1.10 * latest close and 1 week ago high < 1.20 * yearly close and latest rsi( 14 ) >= 50 and market cap > 500 and latest ema( latest close , 50 ) > latest ema( latest close , 200 ) and latest ema( latest close , 10 ) > latest ema( latest close , 20 ) and latest ema( latest close , 20 ) > latest ema( latest close , 89 ) and latest ema( latest close , 89 ) > latest ema( latest close , 200 ) and latest close > 50 and latest close > latest ema( latest close , 10 ) ) ) ) )"""
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-class TrueYesterdayOnlyMonitor:
+class WebsiteBacktestMonitor:
     def __init__(self):
-        self.ignored_today_stocks = set()  # Stocks to ignore (today's stocks)
-        self.session = requests.Session()
+        self.previous_backtest_stocks = {}  # {date: [stock_names]}
         self.ist = pytz.timezone('Asia/Kolkata')
-        self.setup_complete = False
-        self.check_count = 0
-        
-        # Target date (29-07-2025)
         self.target_date = "29-07-2025"
+        self.driver = None
         
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-        })
+    def setup_browser(self):
+        """Setup headless Chrome browser"""
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            
+            self.driver = webdriver.Chrome(options=chrome_options)
+            return True
+        except Exception as e:
+            logging.error(f"Browser setup failed: {e}")
+            return False
+    
+    def get_backtest_results(self):
+        """Scrape backtest results from the actual website"""
+        try:
+            if not self.driver:
+                if not self.setup_browser():
+                    return {}
+            
+            # Load the scanner page
+            self.driver.get(SCANNER_URL)
+            time.sleep(5)
+            
+            # Look for backtest results button and click it
+            try:
+                backtest_button = WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'backtest') or contains(text(), 'Backtest')]"))
+                )
+                backtest_button.click()
+                time.sleep(3)
+            except:
+                logging.error("Backtest button not found")
+                return {}
+            
+            # Extract date-wise results
+            backtest_data = {}
+            
+            # Look for date sections in the backtest results
+            date_sections = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'date') or contains(text(), '2025')]")
+            
+            for section in date_sections:
+                try:
+                    # Extract date from section
+                    section_text = section.text
+                    if "29-07-2025" in section_text or "29/07/2025" in section_text or "Jul 29" in section_text:
+                        # This section contains results for our target date
+                        
+                        # Find stock names in this section
+                        stocks_in_section = []
+                        stock_elements = section.find_elements(By.XPATH, ".//following-sibling::*//td[contains(@class, 'name')] | .//following-sibling::*//a[contains(@href, 'quote')]")
+                        
+                        for stock_elem in stock_elements[:10]:  # Limit to first 10 to avoid overflow
+                            stock_name = stock_elem.text.strip()
+                            if stock_name and len(stock_name) > 2:
+                                stocks_in_section.append(stock_name)
+                        
+                        if stocks_in_section:
+                            backtest_data[self.target_date] = stocks_in_section
+                            break
+                
+                except Exception as e:
+                    continue
+            
+            return backtest_data
+            
+        except Exception as e:
+            logging.error(f"Backtest scraping error: {e}")
+            return {}
     
     def send_telegram(self, message):
         """Send Telegram message"""
@@ -73,157 +140,67 @@ class TrueYesterdayOnlyMonitor:
             logging.error(f"Email error: {e}")
             return False
     
-    def get_scanner_stocks(self):
-        """Get scanner results"""
-        try:
-            # Get CSRF token
-            response = self.session.get(SCANNER_URL, timeout=15)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            token = soup.find('meta', {'name': 'csrf-token'})
-            if not token:
-                return None
+    def check_backtest_changes(self):
+        """Check for new stocks in backtest results"""
+        current_backtest = self.get_backtest_results()
+        
+        if self.target_date in current_backtest:
+            current_stocks = set(current_backtest[self.target_date])
+            previous_stocks = set(self.previous_backtest_stocks.get(self.target_date, []))
             
-            # Query scanner
-            headers = {
-                'X-CSRF-TOKEN': token['content'],
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': SCANNER_URL,
-            }
+            new_stocks = current_stocks - previous_stocks
             
-            data = {'scan_clause': YOUR_SCAN_CLAUSE}
-            response = self.session.post('https://chartink.com/screener/process', 
-                                       headers=headers, data=data, timeout=20)
-            
-            if response.status_code == 200:
-                result = response.json()
-                stocks = {}
+            if new_stocks:
+                timestamp = datetime.now(self.ist).strftime("%d-%m-%Y %H:%M:%S IST")
                 
-                if 'data' in result and result['data']:
-                    for stock in result['data']:
-                        name = stock.get('name', '')
-                        price = stock.get('close', 0)
-                        if name:
-                            stocks[name] = price
+                alert_msg = f"🎯 <b>BACKTEST ALERT - New Stocks for {self.target_date}!</b>\n\n"
+                alert_msg += f"⏰ <b>Detected at:</b> {timestamp}\n"
+                alert_msg += f"📊 <b>Source:</b> Website backtest results\n\n"
+                alert_msg += f"🟢 <b>NEW STOCKS FOR {self.target_date} ({len(new_stocks)}):</b>\n\n"
                 
-                return stocks
-            return None
+                for stock in sorted(new_stocks):
+                    alert_msg += f"• <b>{stock}</b>\n"
+                
+                alert_msg += f"\n💡 <b>These stocks appeared in backtest results for {self.target_date}!</b>\n"
+                alert_msg += f"🎯 <b>This is the GALLANTT-type alert you wanted!</b>"
+                
+                # Send alerts
+                self.send_telegram(alert_msg)
+                self.send_email(f"🎯 BACKTEST: New stocks for {self.target_date}", alert_msg)
+                
+                logging.info(f"🎯 BACKTEST ALERT: {new_stocks} for {self.target_date}")
             
-        except Exception as e:
-            logging.error(f"Scanner error: {e}")
-            return None
+            # Update previous stocks
+            self.previous_backtest_stocks[self.target_date] = list(current_stocks)
     
-    def setup_today_baseline(self):
-        """Setup: Mark all current stocks as 'today's stocks' to ignore"""
-        stocks = self.get_scanner_stocks()
-        if stocks is None:
-            return False
-        
-        self.ignored_today_stocks = set(stocks.keys())
-        self.setup_complete = True
-        
-        # Send setup confirmation
-        setup_msg = f"🔧 <b>SETUP COMPLETE - Today's Stocks Ignored</b>\n\n"
-        setup_msg += f"📅 <b>Target Date:</b> {self.target_date}\n"
-        setup_msg += f"❌ <b>Ignoring {len(self.ignored_today_stocks)} TODAY'S stocks:</b>\n"
-        
-        if self.ignored_today_stocks:
-            for stock in sorted(list(self.ignored_today_stocks)[:5]):
-                setup_msg += f"• {stock} (IGNORED - today's stock)\n"
-            if len(self.ignored_today_stocks) > 5:
-                setup_msg += f"... and {len(self.ignored_today_stocks) - 5} more today's stocks (ALL IGNORED)\n"
-        
-        setup_msg += f"\n✅ <b>Now ONLY monitoring for NEW stocks appearing for {self.target_date}</b>\n"
-        setup_msg += f"🎯 <b>Will alert when GALLANTT-type stocks appear for yesterday!</b>"
-        
-        if self.send_telegram(setup_msg):
-            logging.info(f"✅ Setup complete - ignoring {len(self.ignored_today_stocks)} today's stocks")
-            return True
-        return False
-    
-    def check_for_yesterday_stocks(self):
-        """Check for stocks appearing for 29-07-2025 ONLY"""
-        self.check_count += 1
-        
-        current_stocks = self.get_scanner_stocks()
-        if current_stocks is None:
-            logging.error("Failed to get scanner results")
-            return
-        
-        current_names = set(current_stocks.keys())
-        
-        # Find stocks that are NOT in today's ignored list (these are for yesterday!)
-        yesterday_stocks = current_names - self.ignored_today_stocks
-        
-        if yesterday_stocks:
-            timestamp = datetime.now(self.ist).strftime("%d-%m-%Y %H:%M:%S IST")
-            
-            alert_msg = f"🚨 <b>YESTERDAY STOCKS FOUND!</b>\n\n"
-            alert_msg += f"📅 <b>Stocks appeared for:</b> {self.target_date}\n"
-            alert_msg += f"⏰ <b>Detected at:</b> {timestamp}\n"
-            alert_msg += f"🔍 <b>Check #{self.check_count}</b>\n\n"
-            alert_msg += f"🟢 <b>STOCKS FOR {self.target_date} ({len(yesterday_stocks)}):</b>\n\n"
-            
-            for stock in sorted(yesterday_stocks):
-                price = current_stocks.get(stock, 0)
-                alert_msg += f"• <b>{stock}</b> - ₹{price:.2f}\n"
-            
-            alert_msg += f"\n💡 <b>These are the 3 stocks for {self.target_date} you mentioned!</b>\n"
-            alert_msg += f"🎯 <b>NOT today's stocks - these are for YESTERDAY only!</b>"
-            
-            # Send alerts
-            telegram_sent = self.send_telegram(alert_msg)
-            email_sent = self.send_email(
-                f"🚨 FOUND: {len(yesterday_stocks)} stocks for {self.target_date}",
-                alert_msg.replace('<b>', '').replace('</b>', '').replace('🚨', '').replace('📅', '').replace('⏰', '').replace('🔍', '').replace('🟢', '').replace('💡', '').replace('🎯', '').replace('•', '-')
-            )
-            
-            logging.info(f"🚨 YESTERDAY ALERT: {yesterday_stocks} for {self.target_date}")
-            
-            # Update ignored list to include the new stocks (so we don't alert again)
-            self.ignored_today_stocks.update(yesterday_stocks)
-        
-        # Log status
-        if self.check_count % 20 == 0:
-            logging.info(f"Status: {self.check_count} checks, ignoring {len(self.ignored_today_stocks)} stocks, found {len(yesterday_stocks) if yesterday_stocks else 0} yesterday stocks")
+    def cleanup(self):
+        """Clean up browser"""
+        if self.driver:
+            self.driver.quit()
 
 def main():
-    monitor = TrueYesterdayOnlyMonitor()
+    monitor = WebsiteBacktestMonitor()
     
-    # Send startup message
-    startup_msg = f"🎯 <b>TRUE YESTERDAY-ONLY MONITOR</b>\n\n"
-    startup_msg += f"📝 <b>Strategy:</b>\n"
-    startup_msg += f"1. Mark ALL current stocks as 'today's stocks'\n"
-    startup_msg += f"2. IGNORE them completely\n"
-    startup_msg += f"3. Alert ONLY when new stocks appear (these are for {monitor.target_date})\n\n"
-    startup_msg += f"🎯 <b>This will catch the 3 stocks you mentioned for 29-07-2025!</b>"
-    
-    monitor.send_telegram(startup_msg)
-    logging.info("🎯 True Yesterday-Only Monitor Starting...")
-    
-    # Step 1: Setup baseline (ignore today's stocks)
-    while not monitor.setup_complete:
-        if monitor.setup_today_baseline():
-            break
-        logging.error("Setup failed, retrying in 30 seconds...")
-        time.sleep(30)
-    
-    # Step 2: Monitor for yesterday stocks only
-    while True:
-        try:
-            now = datetime.now(monitor.ist)
-            if now.weekday() < 5 and 8 <= now.hour <= 20:  # Extended hours
-                monitor.check_for_yesterday_stocks()
+    try:
+        # Send startup message
+        startup_msg = f"🌐 <b>WEBSITE BACKTEST MONITOR</b>\n\n"
+        startup_msg += f"🎯 <b>Method:</b> Scrape actual website backtest results\n"
+        startup_msg += f"📅 <b>Target:</b> {monitor.target_date}\n"
+        startup_msg += f"🔍 <b>Source:</b> Browser automation on chartink.com\n"
+        startup_msg += f"⚡ <b>This will catch GALLANTT in backtest results!</b>"
+        
+        monitor.send_telegram(startup_msg)
+        logging.info("🌐 Website Backtest Monitor Started")
+        
+        while True:
+            monitor.check_backtest_changes()
+            time.sleep(300)  # Check every 5 minutes
             
-            time.sleep(60)  # Check every minute
-            
-        except KeyboardInterrupt:
-            logging.info("Monitor stopped")
-            break
-        except Exception as e:
-            logging.error(f"Error: {e}")
-            time.sleep(120)
+    except KeyboardInterrupt:
+        logging.info("Monitor stopped")
+    finally:
+        monitor.cleanup()
 
 if __name__ == "__main__":
     main()
-    
+        
