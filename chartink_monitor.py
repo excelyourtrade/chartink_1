@@ -268,10 +268,10 @@ def main():
     try:
         # Send startup message
         startup_msg = f"📊 <b>CSV YESTERDAY MONITOR STARTED</b>\n\n"
-        startup_msg += f"🎯 <b>Method:</b> Download CSV every 10 minutes\n"
+        startup_msg += f"🎯 <b>Method:</b> Download CSV every 5 minutes\n"
         startup_msg += f"📅 <b>Target Date:</b> {monitor.target_date_display}\n"
         startup_msg += f"📁 <b>Source:</b> Direct CSV download (blob URL handled)\n"
-        startup_msg += f"⚡ <b>Frequency:</b> Every 10 minutes during market hours\n\n"
+        startup_msg += f"⚡ <b>Frequency:</b> Every 5 minutes during market hours\n\n"
         startup_msg += f"✅ <b>This will catch GALLANTT appearing in CSV for yesterday!</b>"
         
         monitor.send_telegram(startup_msg)
@@ -287,18 +287,18 @@ def main():
                     check_count += 1
                     logging.info(f"Completed CSV check #{check_count}")
                 
-                time.sleep(600)  # Check every 10 minutes
+                time.sleep(300)  # Check every 5 minutes ✅ CHANGED FROM 600 to 300
                 
             except KeyboardInterrupt:
                 logging.info("CSV Monitor stopped")
                 break
             except Exception as e:
                 logging.error(f"Main loop error: {e}")
-                time.sleep(300)  # Wait 5 minutes on error
+                time.sleep(180)  # Wait 3 minutes on error (also reduced)
                 
     finally:
         monitor.cleanup()
 
 if __name__ == "__main__":
     main()
-        
+            
