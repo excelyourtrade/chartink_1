@@ -22,50 +22,40 @@ YOUR_SCAN_CLAUSE = """( {cash} ( ( {cash} ( quarterly gross sales > 1 quarter ag
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-class ReliableYesterdayMonitor:
+class TrueYesterdayOnlyMonitor:
     def __init__(self):
-        self.baseline_stocks = set()
+        self.ignored_today_stocks = set()  # Stocks to ignore (today's stocks)
         self.session = requests.Session()
         self.ist = pytz.timezone('Asia/Kolkata')
-        self.initialized = False
+        self.setup_complete = False
         self.check_count = 0
         
-        # Get yesterday's date
-        yesterday = datetime.now(self.ist) - timedelta(days=1)
-        while yesterday.weekday() >= 5:  # Skip weekends
-            yesterday -= timedelta(days=1)
-        self.target_date = yesterday.strftime('%d-%m-%Y')
+        # Target date (29-07-2025)
+        self.target_date = "29-07-2025"
         
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Connection': 'keep-alive',
         })
     
     def send_telegram(self, message):
-        """Send Telegram message with retry"""
-        for attempt in range(3):
-            try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                data = {
-                    'chat_id': CHAT_ID,
-                    'text': message,
-                    'parse_mode': 'HTML',
-                    'disable_web_page_preview': True
-                }
-                response = requests.post(url, data=data, timeout=15)
-                if response.status_code == 200:
-                    return True
-                else:
-                    logging.error(f"Telegram failed: {response.status_code} - {response.text}")
-            except Exception as e:
-                logging.error(f"Telegram attempt {attempt + 1} failed: {e}")
-                time.sleep(2)
-        return False
+        """Send Telegram message"""
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = {
+                'chat_id': CHAT_ID,
+                'text': message,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            }
+            response = requests.post(url, data=data, timeout=15)
+            return response.status_code == 200
+        except Exception as e:
+            logging.error(f"Telegram error: {e}")
+            return False
     
     def send_email(self, subject, body):
-        """Send email with retry"""
+        """Send email"""
         try:
             msg = email.mime.multipart.MIMEMultipart()
             msg["From"] = SENDER_EMAIL
@@ -80,171 +70,159 @@ class ReliableYesterdayMonitor:
             server.quit()
             return True
         except Exception as e:
-            logging.error(f"Email failed: {e}")
+            logging.error(f"Email error: {e}")
             return False
     
-    def get_scanner_results(self):
-        """Get scanner results with better error handling"""
+    def get_scanner_stocks(self):
+        """Get scanner results"""
         try:
-            # Get page first
-            page_response = self.session.get(SCANNER_URL, timeout=15)
-            if page_response.status_code != 200:
-                logging.error(f"Page load failed: {page_response.status_code}")
+            # Get CSRF token
+            response = self.session.get(SCANNER_URL, timeout=15)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            token = soup.find('meta', {'name': 'csrf-token'})
+            if not token:
                 return None
             
-            # Extract CSRF token
-            soup = BeautifulSoup(page_response.content, 'html.parser')
-            csrf_token = soup.find('meta', {'name': 'csrf-token'})
-            if not csrf_token:
-                logging.error("CSRF token not found")
-                return None
-            
-            # Make scanner request
+            # Query scanner
             headers = {
-                'X-CSRF-TOKEN': csrf_token['content'],
+                'X-CSRF-TOKEN': token['content'],
                 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
                 'X-Requested-With': 'XMLHttpRequest',
                 'Referer': SCANNER_URL,
             }
             
             data = {'scan_clause': YOUR_SCAN_CLAUSE}
+            response = self.session.post('https://chartink.com/screener/process', 
+                                       headers=headers, data=data, timeout=20)
             
-            scanner_response = self.session.post(
-                'https://chartink.com/screener/process',
-                headers=headers,
-                data=data,
-                timeout=20
-            )
-            
-            if scanner_response.status_code != 200:
-                logging.error(f"Scanner failed: {scanner_response.status_code}")
-                return None
-            
-            result = scanner_response.json()
-            stocks = {}
-            
-            if 'data' in result and result['data']:
-                for stock in result['data']:
-                    name = stock.get('name', 'Unknown')
-                    price = stock.get('close', 0)
-                    if name != 'Unknown':
-                        stocks[name] = price
-            
-            logging.info(f"Retrieved {len(stocks)} stocks from scanner")
-            return stocks
+            if response.status_code == 200:
+                result = response.json()
+                stocks = {}
+                
+                if 'data' in result and result['data']:
+                    for stock in result['data']:
+                        name = stock.get('name', '')
+                        price = stock.get('close', 0)
+                        if name:
+                            stocks[name] = price
+                
+                return stocks
+            return None
             
         except Exception as e:
             logging.error(f"Scanner error: {e}")
             return None
     
+    def setup_today_baseline(self):
+        """Setup: Mark all current stocks as 'today's stocks' to ignore"""
+        stocks = self.get_scanner_stocks()
+        if stocks is None:
+            return False
+        
+        self.ignored_today_stocks = set(stocks.keys())
+        self.setup_complete = True
+        
+        # Send setup confirmation
+        setup_msg = f"🔧 <b>SETUP COMPLETE - Today's Stocks Ignored</b>\n\n"
+        setup_msg += f"📅 <b>Target Date:</b> {self.target_date}\n"
+        setup_msg += f"❌ <b>Ignoring {len(self.ignored_today_stocks)} TODAY'S stocks:</b>\n"
+        
+        if self.ignored_today_stocks:
+            for stock in sorted(list(self.ignored_today_stocks)[:5]):
+                setup_msg += f"• {stock} (IGNORED - today's stock)\n"
+            if len(self.ignored_today_stocks) > 5:
+                setup_msg += f"... and {len(self.ignored_today_stocks) - 5} more today's stocks (ALL IGNORED)\n"
+        
+        setup_msg += f"\n✅ <b>Now ONLY monitoring for NEW stocks appearing for {self.target_date}</b>\n"
+        setup_msg += f"🎯 <b>Will alert when GALLANTT-type stocks appear for yesterday!</b>"
+        
+        if self.send_telegram(setup_msg):
+            logging.info(f"✅ Setup complete - ignoring {len(self.ignored_today_stocks)} today's stocks")
+            return True
+        return False
+    
     def check_for_yesterday_stocks(self):
-        """Main checking function"""
+        """Check for stocks appearing for 29-07-2025 ONLY"""
         self.check_count += 1
         
-        # Get current scanner results
-        current_stocks = self.get_scanner_results()
+        current_stocks = self.get_scanner_stocks()
         if current_stocks is None:
             logging.error("Failed to get scanner results")
             return
         
         current_names = set(current_stocks.keys())
         
-        if not self.initialized:
-            # First run - establish baseline
-            self.baseline_stocks = current_names.copy()
-            self.initialized = True
-            
-            # Send test message to confirm working
-            test_msg = f"🧪 <b>TEST - Monitor Started Successfully!</b>\n\n"
-            test_msg += f"📅 <b>Monitoring for stocks appearing for:</b> {self.target_date}\n"
-            test_msg += f"📊 <b>Current baseline:</b> {len(self.baseline_stocks)} stocks\n\n"
-            if self.baseline_stocks:
-                test_msg += f"<b>Current stocks:</b>\n"
-                for stock in sorted(list(self.baseline_stocks)[:5]):  # Show first 5
-                    test_msg += f"• {stock}\n"
-                if len(self.baseline_stocks) > 5:
-                    test_msg += f"... and {len(self.baseline_stocks) - 5} more\n"
-            
-            test_msg += f"\n✅ <b>System is working! Will alert when GALLANTT-type stocks appear for {self.target_date}</b>"
-            
-            if self.send_telegram(test_msg):
-                logging.info("✅ Test message sent - system working")
-            else:
-                logging.error("❌ Test message failed")
-            
-            return
+        # Find stocks that are NOT in today's ignored list (these are for yesterday!)
+        yesterday_stocks = current_names - self.ignored_today_stocks
         
-        # Find NEW stocks (these appeared for yesterday due to repainting)
-        new_stocks = current_names - self.baseline_stocks
-        
-        if new_stocks:
+        if yesterday_stocks:
             timestamp = datetime.now(self.ist).strftime("%d-%m-%Y %H:%M:%S IST")
             
-            # Create alert
-            alert_msg = f"🚨 <b>YESTERDAY STOCK ALERT!</b>\n\n"
+            alert_msg = f"🚨 <b>YESTERDAY STOCKS FOUND!</b>\n\n"
             alert_msg += f"📅 <b>Stocks appeared for:</b> {self.target_date}\n"
             alert_msg += f"⏰ <b>Detected at:</b> {timestamp}\n"
-            alert_msg += f"🔄 <b>Check #{self.check_count}</b>\n\n"
-            alert_msg += f"🟢 <b>NEW STOCKS FOR {self.target_date} ({len(new_stocks)}):</b>\n\n"
+            alert_msg += f"🔍 <b>Check #{self.check_count}</b>\n\n"
+            alert_msg += f"🟢 <b>STOCKS FOR {self.target_date} ({len(yesterday_stocks)}):</b>\n\n"
             
-            for stock in sorted(new_stocks):
+            for stock in sorted(yesterday_stocks):
                 price = current_stocks.get(stock, 0)
                 alert_msg += f"• <b>{stock}</b> - ₹{price:.2f}\n"
             
-            alert_msg += f"\n💡 <b>These stocks just appeared for {self.target_date} due to repainting!</b>\n"
-            alert_msg += f"🎯 <b>Check these stocks for yesterday's opportunity</b>"
+            alert_msg += f"\n💡 <b>These are the 3 stocks for {self.target_date} you mentioned!</b>\n"
+            alert_msg += f"🎯 <b>NOT today's stocks - these are for YESTERDAY only!</b>"
             
             # Send alerts
             telegram_sent = self.send_telegram(alert_msg)
             email_sent = self.send_email(
-                f"🚨 YESTERDAY STOCKS: {len(new_stocks)} for {self.target_date}",
-                alert_msg.replace('<b>', '').replace('</b>', '').replace('🚨', '').replace('📅', '').replace('⏰', '').replace('🔄', '').replace('🟢', '').replace('💡', '').replace('🎯', '').replace('•', '-')
+                f"🚨 FOUND: {len(yesterday_stocks)} stocks for {self.target_date}",
+                alert_msg.replace('<b>', '').replace('</b>', '').replace('🚨', '').replace('📅', '').replace('⏰', '').replace('🔍', '').replace('🟢', '').replace('💡', '').replace('🎯', '').replace('•', '-')
             )
             
-            logging.info(f"🚨 ALERT SENT: {new_stocks} for {self.target_date} (Telegram: {telegram_sent}, Email: {email_sent})")
+            logging.info(f"🚨 YESTERDAY ALERT: {yesterday_stocks} for {self.target_date}")
             
-            # Update baseline
-            self.baseline_stocks = current_names.copy()
-        else:
-            # No new stocks - just update baseline
-            self.baseline_stocks = current_names.copy()
+            # Update ignored list to include the new stocks (so we don't alert again)
+            self.ignored_today_stocks.update(yesterday_stocks)
         
-        # Log status every 30 checks
-        if self.check_count % 30 == 0:
-            logging.info(f"Status: {self.check_count} checks completed, monitoring {len(current_names)} stocks for {self.target_date}")
+        # Log status
+        if self.check_count % 20 == 0:
+            logging.info(f"Status: {self.check_count} checks, ignoring {len(self.ignored_today_stocks)} stocks, found {len(yesterday_stocks) if yesterday_stocks else 0} yesterday stocks")
 
 def main():
-    """Main function"""
-    monitor = ReliableYesterdayMonitor()
+    monitor = TrueYesterdayOnlyMonitor()
     
     # Send startup message
-    startup_msg = f"🚀 <b>RELIABLE YESTERDAY MONITOR</b>\n\n"
-    startup_msg += f"🎯 <b>Target:</b> Catch stocks like GALLANTT for {monitor.target_date}\n"
-    startup_msg += f"⚡ <b>Method:</b> Detect ANY new stocks in scanner\n"
-    startup_msg += f"🕐 <b>Frequency:</b> Every 45 seconds during market hours\n"
-    startup_msg += f"📱 <b>Alerts:</b> Telegram + Email\n\n"
-    startup_msg += f"✅ <b>This WILL catch GALLANTT-type alerts!</b>"
+    startup_msg = f"🎯 <b>TRUE YESTERDAY-ONLY MONITOR</b>\n\n"
+    startup_msg += f"📝 <b>Strategy:</b>\n"
+    startup_msg += f"1. Mark ALL current stocks as 'today's stocks'\n"
+    startup_msg += f"2. IGNORE them completely\n"
+    startup_msg += f"3. Alert ONLY when new stocks appear (these are for {monitor.target_date})\n\n"
+    startup_msg += f"🎯 <b>This will catch the 3 stocks you mentioned for 29-07-2025!</b>"
     
     monitor.send_telegram(startup_msg)
-    logging.info(f"🚀 Reliable Monitor Started for {monitor.target_date}")
+    logging.info("🎯 True Yesterday-Only Monitor Starting...")
     
+    # Step 1: Setup baseline (ignore today's stocks)
+    while not monitor.setup_complete:
+        if monitor.setup_today_baseline():
+            break
+        logging.error("Setup failed, retrying in 30 seconds...")
+        time.sleep(30)
+    
+    # Step 2: Monitor for yesterday stocks only
     while True:
         try:
-            # Check during extended hours (8 AM - 7 PM IST) on weekdays
             now = datetime.now(monitor.ist)
-            if now.weekday() < 5 and 8 <= now.hour <= 19:
+            if now.weekday() < 5 and 8 <= now.hour <= 20:  # Extended hours
                 monitor.check_for_yesterday_stocks()
-            else:
-                logging.info("Outside monitoring hours")
             
-            time.sleep(45)  # Check every 45 seconds
+            time.sleep(60)  # Check every minute
             
         except KeyboardInterrupt:
-            logging.info("Monitor stopped by user")
+            logging.info("Monitor stopped")
             break
         except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            time.sleep(60)
+            logging.error(f"Error: {e}")
+            time.sleep(120)
 
 if __name__ == "__main__":
     main()
